@@ -282,4 +282,64 @@ class IamResourceTagsInResponseTest {
             .body(not(containsString("<Tags>")))
             .body(not(containsString("profile-must-not-be-listed")));
     }
+
+    /**
+     * Unlike Role, User and Policy, AWS documents no listing-subset exclusion for
+     * InstanceProfile: ListInstanceProfiles uses the same InstanceProfile shape as
+     * CreateInstanceProfile and GetInstanceProfile, so its own tags (not the embedded role's)
+     * belong on all three. CreateInstanceProfile also accepts Tags at creation time, which it
+     * previously silently dropped.
+     */
+    @Test
+    void createAndGetInstanceProfileEchoTheirOwnTags() {
+        String profile = "TagEchoProfile";
+
+        iam("CreateInstanceProfile")
+            .formParam("InstanceProfileName", profile)
+            .formParam("Tags.member.1.Key", "Environment")
+            .formParam("Tags.member.1.Value", "dev")
+        .when().post("/").then()
+            .statusCode(200)
+            .body(containsString("<Key>Environment</Key>"))
+            .body(containsString("<Value>dev</Value>"));
+
+        iam("GetInstanceProfile")
+            .formParam("InstanceProfileName", profile)
+        .when().post("/").then()
+            .statusCode(200)
+            .body(containsString("<Key>Environment</Key>"))
+            .body(containsString("<Value>dev</Value>"));
+    }
+
+    @Test
+    void getInstanceProfileOmitsTheTagsElementEntirelyWhenUntagged() {
+        String profile = "UntaggedEchoProfile";
+
+        iam("CreateInstanceProfile")
+            .formParam("InstanceProfileName", profile)
+        .when().post("/").then().statusCode(200);
+
+        iam("GetInstanceProfile")
+            .formParam("InstanceProfileName", profile)
+        .when().post("/").then()
+            .statusCode(200)
+            .body(not(containsString("<Tags>")));
+    }
+
+    @Test
+    void listInstanceProfilesIncludesTagsUnlikeListRolesListUsersAndListPolicies() {
+        String profile = "ListIncludesTagsProfile";
+
+        iam("CreateInstanceProfile")
+            .formParam("InstanceProfileName", profile)
+            .formParam("Tags.member.1.Key", "ListProfilesMarker")
+            .formParam("Tags.member.1.Value", "must-be-listed")
+        .when().post("/").then().statusCode(200);
+
+        iam("ListInstanceProfiles")
+        .when().post("/").then()
+            .statusCode(200)
+            .body(containsString("<InstanceProfileName>" + profile + "</InstanceProfileName>"))
+            .body(containsString("must-be-listed"));
+    }
 }
