@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -112,6 +113,121 @@ class ReposiliteSidecarClientTest {
         client.ensureRepository("dom--repo");
 
         assertThat(lastMethod.get(), equalTo("GET"));
+    }
+
+    @Test
+    void interfaceEnsureReadyProvisionsTheRepositoryAndReturnsTheSidecarBaseUrl() throws Exception {
+        server.createContext("/api/settings/domain/maven", exchange -> {
+            if ("PUT".equals(exchange.getRequestMethod())) {
+                exchange.getRequestBody().readAllBytes();
+                respond(exchange, 200, "{}");
+            } else {
+                respond(exchange, 200, settingsBody.get());
+            }
+        });
+        server.createContext("/api/maven/details/dom--repo/.floci-repository-ready-probe",
+                exchange -> respond(exchange, 404, "{\"status\":404,\"message\":\"File not found\"}"));
+
+        // publicUrl is unused for Maven (no self-referential URLs to rewrite); passing a value
+        // anyway to prove it is accepted without error, not just null.
+        String baseUrl = client.ensureReady("dom--repo", "http://localhost:4566/codeartifact/maven/dom/repo/");
+
+        assertThat(baseUrl, equalTo("http://127.0.0.1:" + server.getAddress().getPort()));
+    }
+
+    @Test
+    void releaseRepositoryDeletesTopLevelEntriesThenRemovesTheSettingsEntry() throws Exception {
+        settingsBody.set("{\"repositories\":["
+                + "{\"id\":\"dom--repo\",\"visibility\":\"PUBLIC\",\"redeployment\":false},"
+                + "{\"id\":\"other--repo\",\"visibility\":\"PUBLIC\",\"redeployment\":false}]}");
+        List<String> deletedEntries = new CopyOnWriteArrayList<>();
+        server.createContext("/api/maven/details/dom--repo", exchange ->
+                respond(exchange, 200, "{\"name\":\"dom--repo\",\"type\":\"DIRECTORY\",\"files\":["
+                        + "{\"name\":\"com\",\"type\":\"DIRECTORY\"},"
+                        + "{\"name\":\"org\",\"type\":\"DIRECTORY\"}]}"));
+        server.createContext("/dom--repo/com", exchange -> {
+            deletedEntries.add("com");
+            respond(exchange, 200, "");
+        });
+        server.createContext("/dom--repo/org", exchange -> {
+            deletedEntries.add("org");
+            respond(exchange, 200, "");
+        });
+        AtomicReference<JsonNode> putBody = new AtomicReference<>();
+        server.createContext("/api/settings/domain/maven", exchange -> {
+            if ("PUT".equals(exchange.getRequestMethod())) {
+                putBody.set(mapper.readTree(exchange.getRequestBody()));
+                respond(exchange, 200, "{}");
+            } else {
+                respond(exchange, 200, settingsBody.get());
+            }
+        });
+
+        client.releaseRepository("dom--repo");
+
+        assertThat(deletedEntries, hasSize(2));
+        assertTrue(deletedEntries.contains("com"));
+        assertTrue(deletedEntries.contains("org"));
+        List<String> remainingIds = new ArrayList<>();
+        putBody.get().path("repositories").forEach(node -> remainingIds.add(node.path("id").asText()));
+        assertThat(remainingIds, equalTo(List.of("other--repo")));
+    }
+
+    @Test
+    void releaseRepositoryRemovesTheSettingsEntryForARegisteredButNeverPublishedToRepository() throws Exception {
+        // Distinct from "never provisioned" (404): this repository is registered but has zero
+        // files, the real shape Reposilite returns for one nobody ever published to.
+        settingsBody.set("{\"repositories\":[{\"id\":\"dom--repo\",\"visibility\":\"PUBLIC\",\"redeployment\":false}]}");
+        server.createContext("/api/maven/details/dom--repo",
+                exchange -> respond(exchange, 200, "{\"name\":\"dom--repo\",\"type\":\"DIRECTORY\",\"files\":[]}"));
+        AtomicReference<JsonNode> putBody = new AtomicReference<>();
+        server.createContext("/api/settings/domain/maven", exchange -> {
+            if ("PUT".equals(exchange.getRequestMethod())) {
+                putBody.set(mapper.readTree(exchange.getRequestBody()));
+                respond(exchange, 200, "{}");
+            } else {
+                respond(exchange, 200, settingsBody.get());
+            }
+        });
+
+        client.releaseRepository("dom--repo");
+
+        assertThat(putBody.get().path("repositories").size(), is(0));
+    }
+
+    @Test
+    void releaseRepositoryIsANoOpForANeverProvisionedRepository() {
+        server.createContext("/api/maven/details/never-repo",
+                exchange -> respond(exchange, 404, "{\"status\":404,\"message\":\"Repository never-repo not found\"}"));
+        AtomicReference<String> settingsMethod = new AtomicReference<>();
+        server.createContext("/api/settings/domain/maven", exchange -> {
+            settingsMethod.set(exchange.getRequestMethod());
+            respond(exchange, 200, settingsBody.get());
+        });
+
+        client.releaseRepository("never-repo");
+
+        // Only ever GETs the current list to check membership; never PUTs a settings change for a
+        // repository that was never in it.
+        assertThat(settingsMethod.get(), equalTo("GET"));
+    }
+
+    @Test
+    void releaseRepositoryDoesNotUnregisterTheRepositoryWhenListingItsFilesFails() {
+        settingsBody.set("{\"repositories\":[{\"id\":\"dom--repo\",\"visibility\":\"PUBLIC\",\"redeployment\":false}]}");
+        server.createContext("/api/maven/details/dom--repo",
+                exchange -> respond(exchange, 500, "{\"status\":500,\"message\":\"internal error\"}"));
+        AtomicReference<String> settingsMethod = new AtomicReference<>();
+        server.createContext("/api/settings/domain/maven", exchange -> {
+            settingsMethod.set(exchange.getRequestMethod());
+            respond(exchange, 200, settingsBody.get());
+        });
+
+        // A non-404 failure while listing means the repository's real content is unknown, not
+        // empty: proceeding to remove it from settings anyway would orphan whatever was never
+        // listed, unreachable afterward, the same failure shape release exists to prevent.
+        assertThrows(IllegalStateException.class, () -> client.releaseRepository("dom--repo"));
+        assertThat(settingsMethod.get() == null || "GET".equals(settingsMethod.get()), is(true));
     }
 
     @Test
