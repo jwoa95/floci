@@ -35,6 +35,8 @@ class StepFunctionsJsonataIntegrationTest {
     @ParameterizedTest
     @ValueSource(ints = {0, 1, 3})
     void indexesAnExplicitArrayProjectionInARealExecution(int count) throws Exception {
+        // jsonata-js reduces the one-item sequence [0] leaves to the object, and the step after it
+        // finds nothing in an object, so only the parenthesized form reaches 'ok'.
         String definition = """
                 {
                     "QueryLanguage": "JSONata",
@@ -44,7 +46,8 @@ class StepFunctionsJsonataIntegrationTest {
                             "Type": "Pass",
                             "Output": {
                                 "wrapped": "{% [$states.input.Items.{'ok':true}] %}",
-                                "first": "{% $exists([$states.input.Items.{'ok':true}][0].ok) %}"
+                                "first": "{% $exists([$states.input.Items.{'ok':true}][0].ok) %}",
+                                "parenthesized": "{% $exists(([$states.input.Items.{'ok':true}])[0].ok) %}"
                             },
                             "End": true
                         }
@@ -56,7 +59,32 @@ class StepFunctionsJsonataIntegrationTest {
         JsonNode output = objectMapper.readTree(waitForExecution(startExecution(machine, input)));
         assertTrue(output.path("wrapped").isArray());
         assertEquals(count, output.path("wrapped").size());
-        assertEquals(count > 0, output.path("first").asBoolean());
+        assertFalse(output.path("first").asBoolean(), output.toString());
+        assertEquals(count > 0, output.path("parenthesized").asBoolean(), output.toString());
+    }
+
+    @Test
+    void outputOfAnIndexedArrayProjectionReturnsNothingAndFailsTheState() throws Exception {
+        String definition = """
+                {
+                    "QueryLanguage": "JSONata",
+                    "StartAt": "Evaluate",
+                    "States": {
+                        "Evaluate": {
+                            "Type": "Pass",
+                            "Output": "{% [$states.input.Items.{'ok':true}][0].ok %}",
+                            "End": true
+                        }
+                    }
+                }
+                """;
+        String machine = createStateMachine("jsonata-array-projection-output", definition);
+        Response failure = waitForExecutionFailure(startExecution(machine, "{\"Items\":[{}]}"));
+
+        assertEquals("States.QueryEvaluationError", failure.jsonPath().getString("error"));
+        String cause = failure.jsonPath().getString("cause");
+        assertTrue(cause.contains("returned nothing (undefined)"), cause);
+        assertFalse(cause.contains("cannot be cast"), cause);
     }
 
     @BeforeAll

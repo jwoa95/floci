@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.stepfunctions;
 import com.dashjoin.jsonata.Functions;
 import com.dashjoin.jsonata.JException;
 import com.dashjoin.jsonata.Jsonata;
+import com.dashjoin.jsonata.Parser;
 import com.dashjoin.jsonata.Utils;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -15,9 +16,11 @@ import com.fasterxml.jackson.databind.node.MissingNode;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -25,7 +28,9 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.text.ParseException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HexFormat;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,6 +53,7 @@ import static io.github.hectorvent.floci.services.stepfunctions.AslExecutor.Fail
  * (AWS does not support string interpolation with multiple {% %} blocks).
  */
 @ApplicationScoped
+@RegisterForReflection(targets = Parser.Symbol.class, fields = true)
 public class JsonataEvaluator {
 
     private static final Set<String> HASH_ALGORITHMS = Set.of("MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512");
@@ -142,6 +148,15 @@ public class JsonataEvaluator {
     private static final String MEMORY_LIMIT_EXCEEDED =
             "Expression evaluation memory limit exceeded: Check for excessive memory usage";
 
+    /**
+     * The parse-tree fields {@link #endPathsAtACollapsedConstructedArray} reads. Dashjoin keeps them
+     * package-private, so they are read reflectively, as {@link JsonataTopLevelReferences} explains,
+     * and resolved here so an upgrade that renames one fails on load.
+     */
+    private static final Field SYMBOL_TYPE = symbolField("type");
+    private static final Field SYMBOL_STEPS = symbolField("steps");
+    private static final Field SYMBOL_KEEP_ARRAY = symbolField("keepArray");
+
     private final ObjectMapper objectMapper;
     private final ObjectReader strictJsonReader;
     private final Map<String, Jsonata.JFunction> stepFunctionsExtensions;
@@ -218,7 +233,7 @@ public class JsonataEvaluator {
             frame.setRuntimeBounds(evaluationTimeoutMillis, maxEvaluationDepth);
             nesting.trackOn(frame);
             boundHeldMemory(frame);
-            preserveConstructedArraySequences(frame);
+            endPathsAtACollapsedConstructedArray(frame);
             stepFunctionsExtensions.forEach(frame::bind);
             // AWS disables $eval, and the library ships it. An unbound name called as a function is
             // the library's own T1006, which is the code AWS answers. $parse is the replacement.
@@ -316,16 +331,54 @@ public class JsonataEvaluator {
     }
 
     /**
-     * A constructed array used as a path step must remain a sequence after a predicate.
-     * Dashjoin 0.9.10 otherwise reduces a one-item filtered array to its object, then
-     * evaluatePath casts that object to List before evaluating the next step.
+     * A path whose first step is an array constructor with a predicate, such as
+     * {@code [$states.input.Items][0].a}, returns nothing when the predicate leaves one item that
+     * is not an array. Both libraries reduce that one-item sequence to the item, but jsonata-js then
+     * iterates the item as the next step's input and finds nothing, where dashjoin 0.9.10 casts it
+     * to {@code List} and fails. Emptying the sequence before the reduction ends the path there,
+     * as on AWS. A string, whose characters jsonata-js iterates, and JSON null, which it fails on,
+     * are left alone.
      */
-    private static void preserveConstructedArraySequences(Jsonata.Frame frame) {
-        afterEachEvaluationStep(frame, (expression, input, environment, result) -> {
-            if (expression.consarray && result instanceof Utils.JList<?> sequence && sequence.sequence) {
-                sequence.keepSingleton = true;
+    private static void endPathsAtACollapsedConstructedArray(Jsonata.Frame frame) {
+        Set<Parser.Symbol> constructedFirstSteps = Collections.newSetFromMap(new IdentityHashMap<>());
+        Jsonata.EntryCallback installed = (Jsonata.EntryCallback) frame.lookup("__evaluate_entry");
+        frame.setEvaluateEntryCallback((expression, input, environment) -> {
+            installed.callback(expression, input, environment);
+            if ("path".equals(readSymbol(SYMBOL_TYPE, expression))
+                    && readSymbol(SYMBOL_STEPS, expression) instanceof List<?> steps && steps.size() > 1
+                    && steps.get(0) instanceof Parser.Symbol first && first.consarray) {
+                constructedFirstSteps.add(first);
             }
         });
+        afterEachEvaluationStep(frame, (expression, input, environment, result) -> {
+            if (constructedFirstSteps.contains(expression) && result instanceof Utils.JList<?> sequence
+                    && sequence.sequence && !sequence.tupleStream && !sequence.keepSingleton
+                    && sequence.size() == 1
+                    && !(sequence.get(0) instanceof List || sequence.get(0) instanceof String
+                            || sequence.get(0) == Jsonata.NULL_VALUE)
+                    && !Boolean.TRUE.equals(readSymbol(SYMBOL_KEEP_ARRAY, expression))) {
+                sequence.clear();
+            }
+        });
+    }
+
+    private static Field symbolField(String name) {
+        try {
+            Field field = Parser.Symbol.class.getDeclaredField(name);
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException e) {
+            throw new IllegalStateException("com.dashjoin:jsonata no longer declares Parser.Symbol." + name, e);
+        }
+    }
+
+    private static Object readSymbol(Field field, Parser.Symbol node) {
+        try {
+            return field.get(node);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException(
+                    "com.dashjoin:jsonata no longer allows reading Parser.Symbol." + field.getName(), e);
+        }
     }
 
     /**
